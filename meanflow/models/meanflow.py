@@ -4,7 +4,7 @@ import torch.nn as nn
 
 from models.time_sampler import sample_two_timesteps
 from models.ema import init_ema, update_ema_net
-from models.weak_loss import experimental_loss
+from models.weak_loss import experimental_loss, weak_terms
 
 
 class MeanFlow(nn.Module):
@@ -75,13 +75,39 @@ class MeanFlow(nn.Module):
         
         return loss
     
-    def sample(self, samples_shape, net=None, device=None):
-        net = net if net is not None else self.net_ema                
+    def loss_terms(self, x):
+        """Weak method only: (diag, weak, logs) kept separate.
 
-        e = torch.randn(samples_shape, dtype=torch.float32, device=device)
-        z_1 = e
-        t = torch.ones(samples_shape[0], device=device)
-        r = torch.zeros(samples_shape[0], device=device)
-        u = net(z_1, (t, t - r), aug_cond=None)
-        z_0 = z_1 - u
-        return z_0
+        The trainer backwards the two terms one after the other so the peak
+        activation memory is the larger graph instead of their sum. Summing
+        first and backwarding once gives identical gradients but needs both
+        graphs alive at the same time.
+        """
+        if getattr(self.args, "method", "mf") != "weak":
+            raise ValueError("loss_terms is only defined for method=weak")
+        return weak_terms(self.net, x, self.args)
+
+    @torch.no_grad()
+    def sample(self, samples_shape, net=None, device=None, num_steps=1,
+               generator=None, initial_noise=None):
+        """MeanFlow transitions on a uniform decreasing time grid; NFE=num_steps."""
+        if not isinstance(num_steps, int) or num_steps < 1:
+            raise ValueError("num_steps must be a positive integer")
+        net = net if net is not None else self.net_ema
+        if device is None:
+            device = next(net.parameters()).device
+        if initial_noise is None:
+            z = torch.randn(samples_shape, dtype=torch.float32, device=device,
+                            generator=generator)
+        else:
+            if tuple(initial_noise.shape) != tuple(samples_shape):
+                raise ValueError("initial_noise shape does not match samples_shape")
+            z = initial_noise.to(device=device, dtype=torch.float32).clone()
+        grid = torch.linspace(1.0, 0.0, num_steps + 1, device=z.device, dtype=z.dtype)
+        for i in range(num_steps):
+            t = grid[i].expand(z.shape[0])
+            h = (grid[i] - grid[i + 1]).expand(z.shape[0])
+            u = net(z, (t, h), aug_cond=None)
+            z = z - h.reshape(-1, *([1] * (z.ndim - 1))) * u
+        # Do not clamp intermediate states or re-inject noise.
+        return z
