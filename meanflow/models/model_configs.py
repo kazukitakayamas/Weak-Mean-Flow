@@ -33,7 +33,8 @@ def instantiate_model(args) -> nn.Module:
         architechture in MODEL_CONFIGS
     ), f"Model architecture {architechture} is missing its config."
 
-    configs = MODEL_CONFIGS[architechture]
+    configs = MODEL_CONFIGS[architechture].copy()
+    configs['model_channels'] = getattr(args, 'model_channels', 128)
     configs['dropout'] = args.dropout
     arch = MODEL_ARCHS[architechture]
     if args.use_edm_aug:
