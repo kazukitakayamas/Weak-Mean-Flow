@@ -70,12 +70,21 @@ def get_data_loader(args, is_for_fid):
 
     logger.info(dataset)
 
+
     logger.info("Intializing DataLoader")
     num_tasks = distributed_mode.get_world_size()
     global_rank = distributed_mode.get_rank()
-    sampler = torch.utils.data.DistributedSampler(
-        dataset, num_replicas=num_tasks, rank=global_rank, shuffle=True
-    )
+    if args.iid_sampling and not is_for_fid:
+        if num_tasks != 1:
+            raise ValueError("The supplied iid experiment runner is single-GPU only")
+        sampler = torch.utils.data.RandomSampler(
+            dataset, replacement=True, num_samples=len(dataset),
+            generator=torch.Generator().manual_seed(args.seed),
+        )
+    else:
+        sampler = torch.utils.data.DistributedSampler(
+            dataset, num_replicas=num_tasks, rank=global_rank, shuffle=True
+        )
     data_loader = torch.utils.data.DataLoader(
         dataset,
         sampler=sampler,
@@ -89,8 +98,25 @@ def get_data_loader(args, is_for_fid):
     return data_loader
 
 
+
 def main(args):
     distributed_mode.init_distributed_mode(args)
+
+    if args.method != "mf":
+        if args.compile or args.dropout != 0 or args.use_edm_aug:
+            raise ValueError("Controlled runs require --not_compile --dropout 0 and no --use_edm_aug")
+        if not args.iid_sampling or distributed_mode.get_world_size() != 1:
+            raise ValueError("Controlled runs require --iid_sampling and one GPU")
+        if args.batch_size < 2:
+            raise ValueError("Use batch_size >= 2")
+        if not 0 <= args.diag_probability <= 1:
+            raise ValueError("diag_probability must be in [0,1]")
+        if args.method == "imf_diag" and args.diag_probability == 0:
+            raise ValueError("imf_diag needs positive diagonal supervision")
+        if args.weak_features < 1 or args.weak_weight < 0:
+            raise ValueError("weak_features >= 1 and weak_weight >= 0 are required")
+        if min(args.weak_sigma_z, args.weak_sigma_r, args.weak_sigma_t) <= 0:
+            raise ValueError("All feature frequency scales must be positive")
 
     print(f"Rank: {distributed_mode.get_rank()}")
     print(f"World Size: {distributed_mode.get_world_size()}")
@@ -191,6 +217,8 @@ def main(args):
     logger.info(f"Start from {args.start_epoch} to {args.epochs} epochs")
     start_time = time.time()
     for epoch in range(args.start_epoch, args.epochs):
+        if args.iid_sampling:
+            data_loader_train.sampler.generator.manual_seed(rng.fold_in(args.seed, epoch, "data"))
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
         if not args.eval_only:
