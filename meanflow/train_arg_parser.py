@@ -22,7 +22,7 @@ def get_args_parser():
     parser.add_argument("--dropout", default=0.2, type=float, help="Dropout rate.")
 
     parser.add_argument("--ema_decay", default=0.9999, type=float, help="Exponential moving average decay rate.")
-    parser.add_argument("--ema_decays", default=[0.99995, 0.9996], nargs="+", type=float, help="Extra EMA decay rates.")
+    parser.add_argument("--ema_decays", default=[0.99995, 0.9996], nargs="*", type=float, help="Extra EMA decay rates; pass with no values to disable extras.")
 
     # Dataset parameters
     parser.add_argument("--dataset", default='cifar10', type=str, choices=['cifar10', 'mnist'], help="Dataset to use.")
@@ -66,8 +66,21 @@ def get_args_parser():
     parser.add_argument("--arch", default="unet", type=str, choices=["unet",], help="Architecture to use.")
     parser.add_argument("--use_edm_aug", action="store_true", dest="use_edm_aug", default=False, help="Enable EDM augmentation with augment labels as conditions.")
 
+    # Experimental losses. 'mf' retains the original loss and sampling code.
+    parser.add_argument("--method", choices=["mf", "mf_control", "imf_diag", "weak"], default="mf")
+    parser.add_argument("--model_channels", type=int, default=128)
+    parser.add_argument("--iid_sampling", action="store_true", help="Sample training data with replacement on one GPU.")
+    parser.add_argument("--diag_probability", type=float, default=0.25)
+    parser.add_argument("--weak_features", type=int, default=64)
+    parser.add_argument("--weak_weight", type=float, default=1.0)
+    parser.add_argument("--weak_sigma_z", type=float, default=1.0)
+    parser.add_argument("--weak_sigma_r", type=float, default=1.0)
+    parser.add_argument("--weak_sigma_t", type=float, default=1.0)
+    parser.add_argument("--weak_fp64", action="store_true", help="Use float64 for weak feature algebra only.")
+
     # Debugging settings
     parser.add_argument("--test_run", action="store_true", help="Only run one batch of training and evaluation.")
     parser.add_argument("--not_compile", action="store_false", dest="compile", default=True, help="Disable compilation.")
+
 
     return parser
