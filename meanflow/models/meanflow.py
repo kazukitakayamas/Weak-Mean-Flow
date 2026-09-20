@@ -4,6 +4,7 @@ import torch.nn as nn
 
 from models.time_sampler import sample_two_timesteps
 from models.ema import init_ema, update_ema_net
+from models.weak_loss import experimental_loss
 
 
 class MeanFlow(nn.Module):
@@ -34,6 +35,13 @@ class MeanFlow(nn.Module):
             update_ema_net(self.net, self._modules[f"net_ema{i + 1}"], num_updates)
 
     def forward_with_loss(self, x, aug_cond):
+
+        # Weak meanflow 追加
+        if getattr(self.args, "method", "mf") != "mf":
+            if aug_cond is not None:
+                raise ValueError("Controlled experiments require aug_cond=None")
+            loss, self.last_losses = experimental_loss(self.net, x, self.args)
+            return loss
 
         device = x.device
         e = torch.randn_like(x).to(device)
