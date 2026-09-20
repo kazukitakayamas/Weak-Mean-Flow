@@ -152,8 +152,14 @@ def train_one_epoch(
                 "steps": steps,
                 "sec_per_iter": sec_per_iter,
             }
+            if hasattr(model_without_ddp, "last_losses"):
+                # Last batch, not epoch means; keep signed weak estimates.
+                details = {k: float(v.item()) for k, v in model_without_ddp.last_losses.items()}
+                logger.info("Last-batch loss components: %s", details)
+                metrics.update({f"last_{k}": v for k, v in details.items()})
             if log_writer is not None:
                 for k, v in metrics.items():
                     log_writer.add_scalar(f"ep_{k}", v, epoch_1000x)  # we use epoch * 1000 to plot, for calibrating different batch sizes
+
 
     return
