@@ -1,0 +1,11 @@
+{
+  "method": "mf_control",
+  "model_channels": 32,
+  "batch_size": 256,
+  "seed": 0,
+  "lr": 0.0003,
+  "warmup_steps": 1000,
+  "ema_decay": 0.999,
+  "horizontal_flip": true,
+  "diag_probability": 0.25
+}
