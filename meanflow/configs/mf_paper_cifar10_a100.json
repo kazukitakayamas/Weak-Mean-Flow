@@ -1,0 +1,18 @@
+{
+  "method": "mf",
+  "model_channels": 32,
+  "batch_size": 256,
+  "seed": 0,
+  "lr": 0.0003,
+  "warmup_steps": 1000,
+  "ema_decay": 0.999,
+  "horizontal_flip": true,
+  "tr_sampler": "v0",
+  "ratio": 0.75,
+  "P_mean_t": -2.0,
+  "P_std_t": 2.0,
+  "P_mean_r": -2.0,
+  "P_std_r": 2.0,
+  "norm_p": 0.75,
+  "norm_eps": 0.001
+}
