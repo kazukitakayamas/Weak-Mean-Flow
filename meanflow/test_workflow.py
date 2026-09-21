@@ -63,8 +63,24 @@ class Config(unittest.TestCase):
     def test_baseline_config_rejects_weak_only_keys(self):
         with self.assertRaises(ValueError) as context:
             validate_config({"method": "imf_diag", "diag_probability": 0.25,
-                             "weak_features": 64})
+                             "weak_features": 32})
         self.assertIn("weak-only keys", str(context.exception))
+
+    def test_merged_config_round_trips_for_every_method(self):
+        """A checkpoint stores the merged config; re-validating it must pass."""
+        for config in ({"method": "mf_control", "diag_probability": 0.25},
+                       {"method": "mf"}, {"method": "weak"}):
+            merged = validate_config(config)
+            self.assertEqual(validate_config(merged), merged)
+
+    def test_mf_config_uses_ratio_not_diag_probability(self):
+        ok = validate_config({"method": "mf", "ratio": 0.5, "norm_p": 1.0})
+        self.assertEqual((ok["ratio"], ok["norm_p"], ok["tr_sampler"]), (0.5, 1.0, "v0"))
+        with self.assertRaises(ValueError):
+            validate_config({"method": "mf", "diag_probability": 0.25})
+        with self.assertRaises(ValueError) as context:
+            validate_config({"method": "weak", "ratio": 0.5})
+        self.assertIn("mf-only keys", str(context.exception))
 
     def test_unknown_key_rejected(self):
         with self.assertRaises(ValueError):
