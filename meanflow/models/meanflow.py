@@ -89,10 +89,12 @@ class MeanFlow(nn.Module):
 
     @torch.no_grad()
     def sample(self, samples_shape, net=None, device=None, num_steps=1,
-               generator=None, initial_noise=None):
+               generator=None, initial_noise=None, sampler="meanflow"):
         """MeanFlow transitions on a uniform decreasing time grid; NFE=num_steps."""
         if not isinstance(num_steps, int) or num_steps < 1:
             raise ValueError("num_steps must be a positive integer")
+        if sampler not in {"meanflow", "fm_euler"}:
+            raise ValueError("sampler must be meanflow or fm_euler")
         net = net if net is not None else self.net_ema
         if device is None:
             device = next(net.parameters()).device
@@ -107,7 +109,10 @@ class MeanFlow(nn.Module):
         for i in range(num_steps):
             t = grid[i].expand(z.shape[0])
             h = (grid[i] - grid[i + 1]).expand(z.shape[0])
-            u = net(z, (t, h), aug_cond=None)
+            # The integration step and the network's interval condition are
+            # different quantities for diagonal-only Flow Matching.
+            condition_h = h if sampler == "meanflow" else torch.zeros_like(h)
+            u = net(z, (t, condition_h), aug_cond=None)
             z = z - h.reshape(-1, *([1] * (z.ndim - 1))) * u
         # Do not clamp intermediate states or re-inject noise.
         return z
