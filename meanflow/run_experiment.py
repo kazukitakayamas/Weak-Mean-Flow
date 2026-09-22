@@ -118,7 +118,11 @@ def cmd_evaluate(args):
     selection_path = evaluation_dir / "selection.json"
 
     settings = {"steps": sorted(args.steps), "num_samples": args.num_samples,
-                "batch_size": args.batch_size, "seed": args.seed}
+                "batch_size": args.batch_size, "seed": args.seed,
+                "weights": getattr(args, "weights", "ema"),
+                "sampler": getattr(args, "sampler", "meanflow"),
+                "num_real_samples": getattr(args, "num_real_samples", 50000),
+                "initial_checkpoint": getattr(args, "initial_checkpoint", "")}
 
     if selection_path.exists():
         selection = json.loads(selection_path.read_text())
@@ -148,7 +152,7 @@ def cmd_evaluate(args):
         atomic_text(json.dumps(selection, indent=2, sort_keys=True), selection_path)
         del payload
 
-    cost = sampling_cost(settings["steps"], args.num_samples)
+    cost = sampling_cost(settings["steps"], args.num_samples, settings["num_real_samples"])
     print(f"pinned checkpoint: {frozen} (train step {selection['train_step']})")
     print(f"generator cost: {cost['image_nfe_total']:,} image-NFE; "
           f"Inception on {cost['inception_images']:,} images")
@@ -161,6 +165,9 @@ def cmd_evaluate(args):
         num_samples=args.num_samples, batch_size=args.batch_size,
         seed=args.seed, max_minutes=args.max_minutes,
         save_every_images=args.save_every_images, device=device,
+        weights=settings["weights"], sampler=settings["sampler"],
+        num_real_samples=settings["num_real_samples"],
+        initial_checkpoint=settings["initial_checkpoint"] or None,
     )
     print(json.dumps({"completed": result["completed"]}, indent=2))
     if not result["completed"]:
@@ -211,7 +218,9 @@ def cmd_report(args):
         axis.get_xaxis().set_major_formatter(matplotlib.ticker.ScalarFormatter())
         axis.set_xlabel("sampling steps (= NFE)")
         axis.set_ylabel("FID")
-        axis.set_title(f"{args.evaluation_name}: train step {selection['train_step']}")
+        axis.set_title(f"{args.evaluation_name}: train step {selection['train_step']}\n"
+                       f"{selection['settings'].get('weights', 'ema')} / "
+                       f"{selection['settings'].get('sampler', 'meanflow')}")
         axis.grid(alpha=0.3)
         figure.tight_layout()
         figure.savefig(evaluation_dir / "fid_vs_steps.png", dpi=150)
@@ -220,6 +229,26 @@ def cmd_report(args):
 
 
 # ---------------------------------------------------------------------------
+
+
+def cmd_diagnose(args):
+    from diagnostics import diagnose
+    result = diagnose(args.checkpoint, args.output_dir, args.data_root,
+                      mode=args.mode, weights=args.weights, repeats=args.repeats,
+                      batch_sizes=args.batch_sizes, feature_counts=args.feature_counts,
+                      resampling=args.resampling, seed=args.seed,
+                      interval_batch=args.interval_batch, device=_device(args.device),
+                      preview_weights=args.preview_weights)
+    print(json.dumps(result, indent=2))
+
+
+def cmd_gaussian(args):
+    from gaussian_validation import run_gaussian
+    result = run_gaussian(args.output_dir, steps=args.steps, batch=args.batch_size,
+                          features=args.features, weights=args.weak_weights,
+                          sigma=args.sigma, dim=args.dim, lr=args.lr, seed=args.seed,
+                          oracle_repeats=args.oracle_repeats, device=_device(args.device))
+    print(json.dumps(result, indent=2))
 
 
 def main():
@@ -259,12 +288,44 @@ def main():
     p.add_argument("--max-minutes", type=float, default=240)
     p.add_argument("--save-every-images", type=int, default=10_000)
     p.add_argument("--checkpoint", default="")
+    p.add_argument("--weights", default="ema", help="raw, ema, ema1 etc.; ema_noinit needs an initial checkpoint")
+    p.add_argument("--sampler", choices=["meanflow", "fm_euler"], default="meanflow")
+    p.add_argument("--num-real-samples", type=int, default=50000)
+    p.add_argument("--initial-checkpoint", default="")
     p.set_defaults(func=cmd_evaluate)
 
     p = sub.add_parser("report")
     p.add_argument("--run-dir", required=True)
     p.add_argument("--evaluation-name", required=True)
     p.set_defaults(func=cmd_report)
+
+    p = sub.add_parser("diagnose", help="Read-only interval and gradient diagnostics")
+    p.add_argument("--checkpoint", required=True)
+    p.add_argument("--output-dir", required=True)
+    p.add_argument("--data-root", required=True)
+    p.add_argument("--mode", choices=["all", "interval", "gradients"], default="all")
+    p.add_argument("--weights", default="raw")
+    p.add_argument("--preview-weights", nargs="+", default=["raw", "ema"])
+    p.add_argument("--repeats", type=int, default=32)
+    p.add_argument("--batch-sizes", nargs="+", type=int)
+    p.add_argument("--feature-counts", nargs="+", type=int)
+    p.add_argument("--resampling", nargs="+", choices=["both", "data", "features"], default=["both"])
+    p.add_argument("--seed", type=int, default=31415)
+    p.add_argument("--interval-batch", type=int, default=64)
+    p.set_defaults(func=cmd_diagnose)
+
+    p = sub.add_parser("gaussian", help="Known-solution learning experiment (no CIFAR)")
+    p.add_argument("--output-dir", required=True)
+    p.add_argument("--steps", type=int, default=2000)
+    p.add_argument("--batch-size", type=int, default=256)
+    p.add_argument("--features", type=int, default=32)
+    p.add_argument("--weak-weights", nargs="+", type=float, default=[0., 1.])
+    p.add_argument("--sigma", type=float, default=.5)
+    p.add_argument("--dim", type=int, default=1)
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--oracle-repeats", type=int, default=64)
+    p.set_defaults(func=cmd_gaussian)
 
     args = parser.parse_args()
     args.func(args)
