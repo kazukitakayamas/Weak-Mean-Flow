@@ -76,6 +76,19 @@ WEAK_ONLY = {
     "weak_P_mean_r", "weak_P_std_r", "weak_diag_time",
 }
 
+# Used only by the existing original MeanFlow loss in models/meanflow.py.
+# Keep these separate so existing weak checkpoint configs stay unchanged.
+MF_DEFAULTS = {
+    "tr_sampler": "v0",
+    "ratio": 0.75,
+    "P_mean_t": -2.0,
+    "P_std_t": 2.0,
+    "P_mean_r": -2.0,
+    "P_std_r": 2.0,
+    "norm_p": 0.75,
+    "norm_eps": 1e-3,
+}
+
 
 # ---------------------------------------------------------------------------
 # config
@@ -88,15 +101,20 @@ def load_config(path):
 
 
 def validate_config(config):
-    unknown = set(config) - set(CONFIG_DEFAULTS)
+    unknown = set(config) - (set(CONFIG_DEFAULTS) | set(MF_DEFAULTS))
     if unknown:
         raise ValueError(f"Unknown config keys: {sorted(unknown)}")
     merged = dict(CONFIG_DEFAULTS)
     merged.update(config)
 
     method = merged["method"]
-    if method not in {"weak", "mf_control", "imf_diag"}:
+    if method not in {"weak", "mf_control", "imf_diag", "mf"}:
         raise ValueError(f"Unsupported method: {method}")
+
+    if method != "mf":
+        mf_keys = sorted(set(config) & set(MF_DEFAULTS))
+        if mf_keys:
+            raise ValueError(f"mf-only keys set for method={method}: {mf_keys}")
 
     if method == "weak":
         # (b) diag_probability is a strong-form knob. Silently carrying it in a
@@ -124,10 +142,33 @@ def validate_config(config):
             )
     else:
         leftovers = sorted(k for k in WEAK_ONLY if k in config)
-        if leftovers:
+        # A merged/saved config contains the ENTIRE default weak block even
+        # for another method. Accept that block on re-validation, while still
+        # rejecting explicitly supplied individual weak settings or overrides.
+        default_weak_block = (
+            WEAK_ONLY.issubset(config)
+            and all(config[k] == CONFIG_DEFAULTS[k] for k in WEAK_ONLY)
+        )
+        if leftovers and not default_weak_block:
             raise ValueError(f"weak-only keys set for method={method}: {leftovers}")
-        if merged["diag_probability"] is None:
+        if method in {"mf_control", "imf_diag"} and merged["diag_probability"] is None:
             raise ValueError(f"method={method} requires diag_probability")
+
+    if method == "mf":
+        if merged["diag_probability"] is not None:
+            raise ValueError("method=mf uses ratio, not diag_probability")
+        for key, default in MF_DEFAULTS.items():
+            merged.setdefault(key, default)
+        if merged["tr_sampler"] not in {"v0", "v1"}:
+            raise ValueError("tr_sampler must be v0 or v1")
+        if not 0 <= merged["ratio"] <= 1:
+            raise ValueError("ratio must be in [0, 1]")
+        if not all(math.isfinite(merged[k]) for k in MF_DEFAULTS if k != "tr_sampler"):
+            raise ValueError("MeanFlow numeric settings must be finite")
+        if merged["P_std_t"] <= 0 or merged["P_std_r"] <= 0:
+            raise ValueError("P_std_t and P_std_r must be positive")
+        if merged["norm_p"] < 0 or merged["norm_eps"] <= 0:
+            raise ValueError("Require norm_p >= 0 and norm_eps > 0")
 
     if merged["batch_size"] < 2:
         raise ValueError("The U statistic needs at least two samples per batch")
@@ -158,6 +199,9 @@ def model_args(config):
     )
     for key in WEAK_ONLY:
         setattr(args, key, config[key])
+    if config["method"] == "mf":
+        for key, default in MF_DEFAULTS.items():
+            setattr(args, key, config.get(key, default))
     return args
 
 
