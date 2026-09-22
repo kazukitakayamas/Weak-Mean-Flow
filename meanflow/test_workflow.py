@@ -69,6 +69,7 @@ class Config(unittest.TestCase):
     def test_merged_config_round_trips_for_every_method(self):
         """A checkpoint stores the merged config; re-validating it must pass."""
         for config in ({"method": "mf_control", "diag_probability": 0.25},
+                       {"method": "imf_diag", "diag_probability": 0.25},
                        {"method": "mf"}, {"method": "weak"}):
             merged = validate_config(config)
             self.assertEqual(validate_config(merged), merged)
@@ -81,6 +82,39 @@ class Config(unittest.TestCase):
         with self.assertRaises(ValueError) as context:
             validate_config({"method": "weak", "ratio": 0.5})
         self.assertIn("mf-only keys", str(context.exception))
+
+    def test_merged_baseline_rejects_changed_weak_defaults(self):
+        for method in ("mf_control", "imf_diag", "mf"):
+            config = {"method": method}
+            if method != "mf":
+                config["diag_probability"] = 0.25
+            merged = validate_config(config)
+            merged["weak_features"] = 32
+            with self.assertRaisesRegex(ValueError, "weak-only keys"):
+                validate_config(merged)
+        with self.assertRaisesRegex(ValueError, "weak-only keys"):
+            validate_config({"method": "mf_control", "diag_probability": 0.25,
+                             "weak_features": workflow.CONFIG_DEFAULTS["weak_features"]})
+
+    def test_mf_settings_reach_loss_and_backward(self):
+        config = validate_config({"method": "mf", "model_channels": 8,
+                                  "batch_size": 4, "ratio": 0.5})
+        args = workflow.model_args(config)
+        self.assertEqual(args.ratio, 0.5)
+        for key in workflow.MF_DEFAULTS:
+            self.assertEqual(getattr(args, key), config[key])
+        model = workflow.instantiate_model(args)
+        loss, _ = workflow._backward_loss(model, torch.randn(4, 3, 8, 8), config)
+        self.assertTrue(torch.isfinite(loss))
+        gradients = [p.grad for p in model.net.parameters() if p.grad is not None]
+        self.assertTrue(gradients)
+        self.assertTrue(all(torch.isfinite(g).all() for g in gradients))
+
+    def test_repository_configs_are_valid_and_round_trip(self):
+        for path in sorted((Path(__file__).parent / "configs").glob("*.json")):
+            with self.subTest(config=path.name):
+                config = workflow.load_config(path)
+                self.assertEqual(validate_config(config), config)
 
     def test_unknown_key_rejected(self):
         with self.assertRaises(ValueError):
@@ -204,7 +238,7 @@ class Pipeline(unittest.TestCase):
         self.assertEqual(sorted(finished["results"]), ["1", "2", "4"])
         for entry in finished["results"].values():
             self.assertEqual(entry["n_fake"], 16)
-            self.assertEqual(entry["n_real"], 16)
+            self.assertEqual(entry["n_real"], len(self.pixels))
             self.assertTrue(entry["fid"] == entry["fid"])  # not NaN
 
     def test_completed_nfe_is_not_recomputed(self):
