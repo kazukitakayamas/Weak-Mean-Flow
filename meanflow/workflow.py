@@ -14,11 +14,13 @@ Two properties this file is responsible for:
 """
 
 import hashlib
+import copy
 import json
 import math
 import os
 import platform
 import subprocess
+import shutil
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -41,6 +43,9 @@ CONFIG_DEFAULTS = {
     "lr": 3e-4,
     "warmup_steps": 1000,
     "ema_decay": 0.9999,
+    "ema_decays": [],
+    "snapshot_steps": [],
+    "step_rng": False,
     "horizontal_flip": True,
     "grad_clip": 0.0,
     # weak-form objective
@@ -62,15 +67,6 @@ CONFIG_DEFAULTS = {
     "weak_diag_time": "uniform",
     # strong-form baselines only
     "diag_probability": None,
-    # original MeanFlow objective only (paper recipe from scripts/cifar10_v0.sh)
-    "tr_sampler": "v0",
-    "ratio": 0.75,
-    "P_mean_t": -2.0,
-    "P_std_t": 2.0,
-    "P_mean_r": -2.0,
-    "P_std_r": 2.0,
-    "norm_p": 0.75,
-    "norm_eps": 1e-3,
 }
 
 WEAK_ONLY = {
@@ -78,11 +74,6 @@ WEAK_ONLY = {
     "weak_sigma_t", "weak_fp64", "weak_test_family", "weak_time_sampler",
     "weak_time_correction", "weak_mixture_alpha", "weak_P_mean_t", "weak_P_std_t",
     "weak_P_mean_r", "weak_P_std_r", "weak_diag_time",
-}
-
-MF_ONLY = {
-    "tr_sampler", "ratio", "P_mean_t", "P_std_t", "P_mean_r", "P_std_r",
-    "norm_p", "norm_eps",
 }
 
 
@@ -96,15 +87,6 @@ def load_config(path):
         return validate_config(json.load(handle))
 
 
-def _non_default(config, keys):
-    """Keys of `keys` that `config` sets to something other than the default.
-
-    A checkpoint stores the merged config, so merely being present is not a
-    signal; only a value that differs from CONFIG_DEFAULTS is a misconfiguration.
-    """
-    return sorted(k for k in keys if k in config and config[k] != CONFIG_DEFAULTS[k])
-
-
 def validate_config(config):
     unknown = set(config) - set(CONFIG_DEFAULTS)
     if unknown:
@@ -113,13 +95,8 @@ def validate_config(config):
     merged.update(config)
 
     method = merged["method"]
-    if method not in {"weak", "mf", "mf_control", "imf_diag"}:
+    if method not in {"weak", "mf_control", "imf_diag"}:
         raise ValueError(f"Unsupported method: {method}")
-
-    if method != "mf":
-        leftovers = _non_default(config, MF_ONLY)
-        if leftovers:
-            raise ValueError(f"mf-only keys set for method={method}: {leftovers}")
 
     if method == "weak":
         # (b) diag_probability is a strong-form knob. Silently carrying it in a
@@ -145,21 +122,8 @@ def validate_config(config):
                 "endpoint test functions need weak_time_correction=importance; "
                 "the adjoint form reweights the boundary term by q(r,1)."
             )
-    elif method == "mf":
-        # Original MeanFlow: r = t is mixed in by `ratio`, not diag_probability.
-        leftovers = _non_default(config, WEAK_ONLY)
-        if leftovers:
-            raise ValueError(f"weak-only keys set for method=mf: {leftovers}")
-        if merged["diag_probability"] is not None:
-            raise ValueError("method=mf uses ratio, not diag_probability")
-        if merged["tr_sampler"] not in {"v0", "v1"}:
-            raise ValueError("tr_sampler must be 'v0' or 'v1'")
-        if not 0.0 <= merged["ratio"] <= 1.0:
-            raise ValueError("ratio must lie in [0, 1]")
-        if merged["norm_p"] < 0 or merged["norm_eps"] <= 0:
-            raise ValueError("norm_p >= 0 and norm_eps > 0 are required")
     else:
-        leftovers = _non_default(config, WEAK_ONLY)
+        leftovers = sorted(k for k in WEAK_ONLY if k in config)
         if leftovers:
             raise ValueError(f"weak-only keys set for method={method}: {leftovers}")
         if merged["diag_probability"] is None:
@@ -169,6 +133,15 @@ def validate_config(config):
         raise ValueError("The U statistic needs at least two samples per batch")
     if merged["model_channels"] < 1 or merged["lr"] <= 0:
         raise ValueError("model_channels and lr must be positive")
+    if any(not 0 <= b < 1 for b in [merged["ema_decay"], *merged["ema_decays"]]):
+        raise ValueError("All EMA decays must be in [0, 1)")
+    if any(type(s) is not int or s < 1 for s in merged["snapshot_steps"]):
+        raise ValueError("snapshot_steps must contain positive integers")
+    if type(merged["step_rng"]) is not bool:
+        raise ValueError("step_rng must be a boolean")
+    if method == "weak" and (merged["weak_weight"] < 0 or merged["diag_weight"] <= 0
+                              or merged["weak_features"] < 1):
+        raise ValueError("Require weak_weight >= 0, diag_weight > 0, weak_features >= 1")
     return merged
 
 
@@ -180,10 +153,10 @@ def model_args(config):
         use_edm_aug=False,
         method=config["method"],
         ema_decay=config["ema_decay"],
-        ema_decays=[],
+        ema_decays=list(config.get("ema_decays", [])),
         diag_probability=config["diag_probability"],
     )
-    for key in WEAK_ONLY | MF_ONLY:
+    for key in WEAK_ONLY:
         setattr(args, key, config[key])
     return args
 
@@ -310,7 +283,7 @@ def _backward_loss(model, x, config):
         if not torch.isfinite(total):
             raise FloatingPointError("Nonfinite loss")
         total.backward()
-        logs = getattr(model, "last_losses", None) or {"strong_mse": total.detach()}
+        logs = getattr(model, "last_losses", {})
         total = total.detach()
     return total, {k: float(v) for k, v in logs.items()}
 
@@ -350,6 +323,10 @@ def train(config, run_dir, data_root, target_steps, session_steps=None,
         step, train_seconds = saved["step"], saved["train_seconds"]
         if int(model.num_updates) != step:
             raise ValueError("EMA update count does not match the checkpoint step")
+        if "rng_cpu" in saved:
+            torch.set_rng_state(saved["rng_cpu"])
+        if device.type == "cuda" and "rng_cuda" in saved:
+            torch.cuda.set_rng_state_all(saved["rng_cuda"])
         del saved
     elif (run_dir / "train.jsonl").exists():
         raise ValueError("A training log exists without a checkpoint; pick another run dir")
@@ -374,13 +351,24 @@ def train(config, run_dir, data_root, target_steps, session_steps=None,
     def save():
         if checkpoint_path.exists():
             os.replace(checkpoint_path, run_dir / "checkpoint-last.previous.pt")
-        atomic_torch_save({
+        payload = {
             "format": FORMAT, "identity": identity, "config": config,
             "source": source, "dataset_sha256": data_hash,
             "image_shape": list(pixels.shape[1:]), "step": step,
             "train_seconds": train_seconds,
             "model": model.state_dict(), "optimizer": optimizer.state_dict(),
-        }, checkpoint_path)
+            "rng_cpu": torch.get_rng_state(),
+        }
+        if device.type == "cuda":
+            payload["rng_cuda"] = torch.cuda.get_rng_state_all()
+        atomic_torch_save(payload, checkpoint_path)
+        if step == 0 or step in config["snapshot_steps"]:
+            snapshot = run_dir / "checkpoints" / f"step-{step:08d}.pt"
+            if not snapshot.exists():
+                snapshot.parent.mkdir(parents=True, exist_ok=True)
+                temporary = snapshot.with_suffix(".pt.tmp")
+                shutil.copyfile(checkpoint_path, temporary)
+                os.replace(temporary, snapshot)
         atomic_text(json.dumps({"step": step, "target_steps": target_steps,
                                 "completed": step >= target_steps,
                                 "train_seconds": train_seconds}, indent=2),
@@ -399,6 +387,10 @@ def train(config, run_dir, data_root, target_steps, session_steps=None,
         for group in optimizer.param_groups:
             group["lr"] = learning_rate(step, config)
         x = training_batch(pixels, step, config, device)
+        if config["step_rng"]:
+            # Loss draws are identical across paired weak_weight=0/1 runs and
+            # do not depend on interruption/resume or diagnostic evaluation.
+            torch.manual_seed((config["seed"] * 1_000_003 + step + 7_000_001) % (2 ** 63 - 1))
         optimizer.zero_grad(set_to_none=True)
         loss, logs = _backward_loss(model, x, config)
         grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -419,6 +411,7 @@ def train(config, run_dir, data_root, target_steps, session_steps=None,
 
         elapsed = time.time() - started
         due = (step % save_every == 0
+               or step in config["snapshot_steps"]
                or time.time() - last_save > save_minutes * 60
                or step >= stop_at
                or elapsed > max_minutes * 60)
@@ -457,6 +450,37 @@ def load_for_eval(checkpoint_path, device):
     model.load_state_dict(payload["model"], strict=True)
     model.eval()
     return model, payload
+
+
+def select_weights(model, name="ema", payload=None, initial_checkpoint=None):
+    """Select saved weights without copying raw weights over a saved EMA."""
+    if name == "raw":
+        return model.net
+    if name == "ema":
+        return model.net_ema
+    if name.startswith("ema") and name[3:].isdigit() and int(name[3:]) >= 1:
+        net = getattr(model, "net_" + name, None)
+        if net is None:
+            raise ValueError(f"Checkpoint has no {name}; inspect config.ema_decays")
+        return net
+    if name == "ema_noinit":
+        if payload is None or not initial_checkpoint:
+            raise ValueError("ema_noinit requires a saved --initial-checkpoint at step 0; no seed reconstruction is assumed")
+        initial = load_checkpoint(initial_checkpoint)
+        if initial["step"] != 0 or initial["identity"] != payload["identity"]:
+            raise ValueError("Initial checkpoint must be step 0 of exactly the same run")
+        updates = int(model.num_updates)
+        if updates != payload["step"] or updates < 16:
+            raise ValueError("EMA update count is inconsistent or no EMA update has occurred")
+        coefficient = model.net_ema.ema_decay ** (16 * (updates // 16))
+        result = copy.deepcopy(model.net_ema)
+        with torch.no_grad():
+            for key, parameter in result.named_parameters():
+                origin = initial["model"]["net." + key].to(parameter.device).double()
+                value = (parameter.double() - coefficient * origin) / (1 - coefficient)
+                parameter.copy_(value.to(parameter.dtype))
+        return result
+    raise ValueError("weights must be raw, ema, ema1 (etc.), or ema_noinit")
 
 
 def initial_noise(seed, batch_index, shape, device):
@@ -539,17 +563,45 @@ def _to_uint8(images):
 
 def evaluate_fid(checkpoint, output_dir, data_root, nfe_values, num_samples,
                  batch_size, seed, max_minutes=240, save_every_images=10_000,
-                 save_minutes=10, device="cuda", pixels=None):
+                 save_minutes=10, device="cuda", pixels=None, weights="ema",
+                 sampler="meanflow", num_real_samples=None, initial_checkpoint=None):
     """Resumable FID for several NFE values off one frozen checkpoint."""
     device = torch.device(device)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    if num_samples % batch_size:
-        raise ValueError("num_samples must be a multiple of batch_size")
+    if num_samples < 2 or batch_size < 1:
+        raise ValueError("Require num_samples >= 2 and batch_size >= 1")
+    if not nfe_values or any(type(n) is not int or n < 1 for n in nfe_values) or len(set(nfe_values)) != len(nfe_values):
+        raise ValueError("NFE values must be distinct positive integers")
+    if sampler not in {"meanflow", "fm_euler"}:
+        raise ValueError("Unknown sampler")
 
     model, payload = load_for_eval(checkpoint, device)
+    net = select_weights(model, weights, payload, initial_checkpoint)
     pixels = load_cifar10(data_root) if pixels is None else pixels
+    real_count = len(pixels) if num_real_samples is None else num_real_samples
+    if not 2 <= real_count <= len(pixels):
+        raise ValueError("num_real_samples must be between 2 and the reference dataset size")
     shape = (batch_size, *payload["image_shape"])
+    protocol = {
+        "format": 1, "checkpoint_sha256": file_sha256(checkpoint),
+        "initial_sha256": file_sha256(initial_checkpoint) if initial_checkpoint else None,
+        "weights": weights, "sampler": sampler, "nfe_values": sorted(nfe_values),
+        "num_samples": num_samples, "num_real_samples": real_count,
+        "batch_size": batch_size, "seed": seed,
+        "real_sha256": hashlib.sha256(pixels[:real_count].contiguous().numpy().tobytes()).hexdigest(),
+        "source": source_identity(), "environment": environment_identity(device),
+        "features": "torch-fidelity Inception-2048 (tests may inject a stub)",
+        "quantization": "round(255 * clamp(0.5*x+0.5,0,1))",
+    }
+    protocol_path = output_dir / "protocol.json"
+    if protocol_path.exists():
+        if json.loads(protocol_path.read_text()) != protocol:
+            raise ValueError("Evaluation protocol changed; use a new evaluation name/directory")
+    elif any(output_dir.iterdir()):
+        raise ValueError("Legacy or incomplete evaluation without protocol; use a new directory")
+    else:
+        atomic_text(json.dumps(protocol, indent=2, sort_keys=True), protocol_path)
     inception = _inception(device)
     results_path = output_dir / "fid_results.json"
     results = json.loads(results_path.read_text()) if results_path.exists() else {}
@@ -561,11 +613,13 @@ def evaluate_fid(checkpoint, output_dir, data_root, nfe_values, num_samples,
     else:
         real = FeatureStats()
         with torch.no_grad():
-            for start in range(0, num_samples, batch_size):
-                batch = pixels[start:start + batch_size].to(device)
+            for start in range(0, real_count, batch_size):
+                batch = pixels[start:min(start + batch_size, real_count)].to(device)
                 real.update(inception(batch))
         atomic_torch_save(real.state(), reference_path)
     print(f"reference features: {real.count}", flush=True)
+    if real.count != real_count:
+        raise ValueError("Cached reference count does not match protocol")
 
     started = time.time()
     for nfe in nfe_values:
@@ -575,16 +629,28 @@ def evaluate_fid(checkpoint, output_dir, data_root, nfe_values, num_samples,
             continue
         partial_path = output_dir / f"stats-fake-nfe{nfe}.pt"
         if partial_path.exists():
-            fake = FeatureStats.from_state(torch.load(partial_path, weights_only=False))
+            partial = torch.load(partial_path, weights_only=False)
+            fake = FeatureStats.from_state(partial)
+            previous_seconds = float(partial.get("seconds", 0))
         else:
             fake = FeatureStats()
+            previous_seconds = 0.0
+        if fake.count > num_samples or (fake.count < num_samples and fake.count % batch_size):
+            raise ValueError("Cached generated sample count is invalid")
         last_save, sample_clock = time.time(), time.time()
+        def save_fake():
+            state = fake.state()
+            state["seconds"] = previous_seconds + time.time() - sample_clock
+            atomic_torch_save(state, partial_path)
         while fake.count < num_samples:
             index = fake.count // batch_size
-            noise = initial_noise(seed, index, shape, device)
+            current_shape = (min(batch_size, num_samples - fake.count), *shape[1:])
+            noise = initial_noise(seed, index, current_shape, device)
             with torch.no_grad():
-                images = model.sample(shape, net=model.net_ema, device=device,
-                                      num_steps=int(nfe), initial_noise=noise)
+                images = model.sample(current_shape, net=net, device=device,
+                                      num_steps=int(nfe), initial_noise=noise, sampler=sampler)
+                if not torch.isfinite(images).all():
+                    raise FloatingPointError("Generated images contain nonfinite values")
                 uint8 = _to_uint8(images)
                 fake.update(inception(uint8))
             if index == 0 and not (output_dir / f"preview-nfe{nfe}.png").exists():
@@ -597,29 +663,30 @@ def evaluate_fid(checkpoint, output_dir, data_root, nfe_values, num_samples,
             due = (fake.count % save_every_images == 0
                    or time.time() - last_save > save_minutes * 60)
             if due:
-                atomic_torch_save(fake.state(), partial_path)
+                save_fake()
                 last_save = time.time()
                 rate = fake.count / max(time.time() - sample_clock, 1e-6)
                 print(f"NFE {nfe}: {fake.count}/{num_samples} ({rate:.0f} img/s)", flush=True)
             if time.time() - started > max_minutes * 60:
-                atomic_torch_save(fake.state(), partial_path)
+                save_fake()
                 print("session time limit reached; rerun to continue", flush=True)
                 return {"completed": False, "results": results}
-        atomic_torch_save(fake.state(), partial_path)
+        save_fake()
         value = frechet_distance(real, fake)
         results[key] = {"fid": value, "n_fake": fake.count, "n_real": real.count,
                         "checkpoint_step": payload["step"],
-                        "seconds": time.time() - sample_clock}
+                        "weights": weights, "sampler": sampler,
+                        "seconds": previous_seconds + time.time() - sample_clock}
         atomic_text(json.dumps(results, indent=2, sort_keys=True), results_path)
         print(f"NFE {nfe}: FID {value:.3f}", flush=True)
 
     return {"completed": len(results) >= len(nfe_values), "results": results}
 
 
-def sampling_cost(nfe_values, num_samples):
+def sampling_cost(nfe_values, num_samples, num_real_samples=None):
     """The arithmetic that decides how long an evaluation takes."""
     per_nfe = {int(n): int(n) * num_samples for n in nfe_values}
     total = sum(per_nfe.values())
     return {"image_nfe_total": total, "per_nfe": per_nfe,
-            "inception_images": num_samples * (len(nfe_values) + 1),
+            "inception_images": num_samples * len(nfe_values) + (num_samples if num_real_samples is None else num_real_samples),
             "share": {k: v / total for k, v in per_nfe.items()}}
