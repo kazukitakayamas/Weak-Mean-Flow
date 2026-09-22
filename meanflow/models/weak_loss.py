@@ -217,7 +217,7 @@ def u_statistic(F, velocity, A, phi):
 def random_fourier_loss(z, velocity, F, t, r, features=64,
                         sigma_z=1.0, sigma_r=1.0, sigma_t=1.0,
                         fp64=False, family="vanishing", weights=None,
-                        dlogq_dt=None, boundary=None):
+                        dlogq_dt=None, boundary=None, feature_parameters=None):
     """One weak-loss evaluation for an already-computed network output.
 
     `weights` (flat [B]) carries the importance correction 2/q (D.123); it
@@ -233,10 +233,17 @@ def random_fourier_loss(z, velocity, F, t, r, features=64,
         dlogq_dt = dlogq_dt.to(dtype)
     with torch.no_grad():
         # Per-update resampling; independent of the batch data; shared in batch.
-        Wz = torch.randn(features, dim, device=z.device, dtype=dtype) * (sigma_z / math.sqrt(dim))
-        br = torch.randn(features, device=z.device, dtype=dtype) * sigma_r
-        ct = torch.randn(features, device=z.device, dtype=dtype) * sigma_t
-        phase = torch.rand(features, device=z.device, dtype=dtype) * (2 * math.pi)
+        if feature_parameters is None:
+            Wz = torch.randn(features, dim, device=z.device, dtype=dtype) * (sigma_z / math.sqrt(dim))
+            br = torch.randn(features, device=z.device, dtype=dtype) * sigma_r
+            ct = torch.randn(features, device=z.device, dtype=dtype) * sigma_t
+            phase = torch.rand(features, device=z.device, dtype=dtype) * (2 * math.pi)
+        else:
+            # Diagnostics inject exactly the same coefficients for FP32/64,
+            # or hold features fixed while independently varying the data.
+            Wz, br, ct, phase = (p.to(device=z.device, dtype=dtype) for p in feature_parameters)
+            if Wz.shape != (features, dim) or any(p.shape != (features,) for p in (br, ct, phase)):
+                raise ValueError("Injected Fourier coefficient shapes do not match")
         A, phi = fourier_coefficients(z, velocity, t, r, Wz, br, ct, phase,
                                       family=family, dlogq_dt=dlogq_dt)
         if weights is not None:
@@ -309,7 +316,7 @@ def _weak_settings(args):
     )
 
 
-def weak_terms(net, x, args):
+def weak_terms(net, x, args, feature_parameters=None):
     """Return (diag_loss, weak_loss, logs) without summing them.
 
     Keeping the two terms separate lets the trainer backward them one at a
@@ -356,7 +363,7 @@ def weak_terms(net, x, args):
     weak = random_fourier_loss(
         z, velocity, F, t, r, cfg["features"], cfg["sigma_z"], cfg["sigma_r"],
         cfg["sigma_t"], cfg["fp64"], family=cfg["family"], weights=weights,
-        dlogq_dt=adjoint, boundary=boundary,
+        dlogq_dt=adjoint, boundary=boundary, feature_parameters=feature_parameters,
     )
 
     # Separate diagonal input; the diagonal term is always evaluated.
